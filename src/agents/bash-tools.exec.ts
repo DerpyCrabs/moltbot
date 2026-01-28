@@ -217,6 +217,13 @@ export type ExecToolDetails =
       command: string;
       cwd?: string;
       nodeId?: string;
+    }
+  | {
+      status: "background";
+      sessionId: string;
+      cwd?: string;
+      host?: "gateway" | "node";
+      nodeId?: string;
     };
 
 function normalizeExecHost(value?: string | null): ExecHost | null {
@@ -1127,6 +1134,83 @@ export function createExecTool(
           };
         }
 
+        // Check if background mode is requested
+        if (yieldWindow === 0) {
+          // Background mode - use system.process.start
+          const raw = (await callGatewayTool(
+            "node.invoke",
+            { timeoutMs: 10_000 },
+            {
+              nodeId,
+              command: "system.process.start",
+              params: {
+                command: argv,
+                rawCommand: params.command,
+                cwd: workdir,
+                env: nodeEnv,
+                usePty: params.pty === true ? true : undefined,
+                agentId,
+                sessionKey: defaults?.sessionKey,
+              },
+              idempotencyKey: crypto.randomUUID(),
+            },
+          )) as { payload?: { sessionId?: string } };
+
+          const sessionId = raw?.payload?.sessionId;
+          if (!sessionId) {
+            throw new Error("Failed to start background process on node");
+          }
+
+          // Register session and return immediately
+          const session: ProcessSession = {
+            id: sessionId,
+            command: params.command,
+            scopeKey: undefined,
+            sessionKey: defaults?.sessionKey,
+            notifyOnExit: false,
+            exitNotified: false,
+            child: undefined,
+            stdin: undefined,
+            pid: undefined,
+            startedAt: Date.now(),
+            cwd: workdir,
+            maxOutputChars: DEFAULT_MAX_OUTPUT,
+            pendingMaxOutputChars: DEFAULT_PENDING_MAX_OUTPUT,
+            totalOutputChars: 0,
+            pendingStdout: [],
+            pendingStderr: [],
+            pendingStdoutChars: 0,
+            pendingStderrChars: 0,
+            aggregated: "",
+            tail: "",
+            exitCode: undefined,
+            exitSignal: undefined,
+            exited: false,
+            truncated: false,
+            backgrounded: true,
+            host: "node",
+            nodeId,
+          };
+          addSession(session);
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Command still running (session ${sessionId}). Use process (list/poll/log/write/kill/clear/remove) for follow-up.`,
+              },
+            ],
+            details: {
+              status: "background",
+              sessionId,
+              cwd: workdir,
+              host: "node",
+              nodeId,
+            } satisfies ExecToolDetails,
+          };
+        }
+
+        // Synchronous mode - use system.run
         const startedAt = Date.now();
         const raw = (await callGatewayTool(
           "node.invoke",

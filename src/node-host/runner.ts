@@ -101,6 +101,47 @@ type SystemExecApprovalsSetParams = {
   baseHash?: string | null;
 };
 
+type SystemProcessStartParams = {
+  command: string[];
+  rawCommand?: string | null;
+  cwd?: string | null;
+  env?: Record<string, string>;
+  usePty?: boolean | null;
+  agentId?: string | null;
+  sessionKey?: string | null;
+};
+
+type SystemProcessLogParams = {
+  sessionId: string;
+  offset?: number | null;
+  limit?: number | null;
+};
+
+type SystemProcessWriteParams = {
+  sessionId: string;
+  data: string;
+  eof?: boolean | null;
+};
+
+type SystemProcessKillParams = {
+  sessionId: string;
+};
+
+type BackgroundProcess = {
+  sessionId: string;
+  argv: string[];
+  rawCommand?: string;
+  cwd?: string;
+  env?: Record<string, string>;
+  usePty: boolean;
+  startedAt: number;
+  pty?: ReturnType<PtySpawn>;
+  child?: ReturnType<typeof spawn>;
+  output: string;
+  exitCode?: number;
+  settled: boolean;
+};
+
 type ExecApprovalsSnapshot = {
   path: string;
   exists: boolean;
@@ -439,6 +480,7 @@ type PtySpawn = (
   onData: (callback: (data: string) => void) => void;
   onExit: (callback: (event: { exitCode: number }) => void) => void;
   kill: (signal?: string) => void;
+  write: (data: string) => void;
 };
 
 async function runCommandWithPty(
@@ -638,6 +680,267 @@ async function runViaMacAppExecHost(params: {
   });
 }
 
+// Background process storage
+const backgroundProcesses = new Map<string, BackgroundProcess>();
+
+async function handleProcessStart(client: GatewayClient, frame: NodeInvokeRequestPayload) {
+  let params: SystemProcessStartParams;
+  try {
+    params = decodeParams<SystemProcessStartParams>(frame.paramsJSON);
+  } catch (err) {
+    await sendInvokeResult(client, frame, {
+      ok: false,
+      error: { code: "INVALID_REQUEST", message: String(err) },
+    });
+    return;
+  }
+
+  if (!Array.isArray(params.command) || params.command.length === 0) {
+    await sendInvokeResult(client, frame, {
+      ok: false,
+      error: { code: "INVALID_REQUEST", message: "command required" },
+    });
+    return;
+  }
+
+  const sessionId = crypto.randomUUID();
+  const argv = params.command.map((item) => String(item));
+  const rawCommand = typeof params.rawCommand === "string" ? params.rawCommand.trim() : "";
+  const cwd = params.cwd?.trim() || undefined;
+  const env = sanitizeEnv(params.env ?? undefined);
+  const usePty = params.usePty === true;
+
+  const proc: BackgroundProcess = {
+    sessionId,
+    argv,
+    rawCommand,
+    cwd,
+    env,
+    usePty,
+    startedAt: Date.now(),
+    output: "",
+    settled: false,
+  };
+
+  backgroundProcesses.set(sessionId, proc);
+
+  // Start the process
+  try {
+    if (usePty) {
+      const ptyModule = (await import("@lydell/node-pty")) as unknown as {
+        spawn?: PtySpawn;
+        default?: { spawn?: PtySpawn };
+      };
+      const spawnPty = ptyModule.spawn ?? ptyModule.default?.spawn;
+      if (!spawnPty) {
+        throw new Error("PTY support is unavailable (node-pty spawn not found).");
+      }
+
+      const pty = spawnPty(argv[0], argv.slice(1), {
+        cwd,
+        env,
+        name: process.env.TERM ?? "xterm-256color",
+        cols: 120,
+        rows: 30,
+      });
+
+      proc.pty = pty;
+
+      pty.onData((data) => {
+        proc.output += data.toString();
+        if (proc.output.length > OUTPUT_CAP) {
+          proc.output = proc.output.substring(proc.output.length - OUTPUT_CAP);
+        }
+      });
+
+      pty.onExit(({ exitCode }) => {
+        proc.exitCode = exitCode;
+        proc.settled = true;
+      });
+    } else {
+      const child = spawn(argv[0], argv.slice(1), {
+        cwd,
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+
+      proc.child = child;
+
+      child.stdout.on("data", (data) => {
+        proc.output += data.toString();
+        if (proc.output.length > OUTPUT_CAP) {
+          proc.output = proc.output.substring(proc.output.length - OUTPUT_CAP);
+        }
+      });
+
+      child.stderr.on("data", (data) => {
+        proc.output += data.toString();
+        if (proc.output.length > OUTPUT_CAP) {
+          proc.output = proc.output.substring(proc.output.length - OUTPUT_CAP);
+        }
+      });
+
+      child.on("exit", (code) => {
+        proc.exitCode = code ?? undefined;
+        proc.settled = true;
+      });
+    }
+
+    await sendInvokeResult(client, frame, {
+      ok: true,
+      payloadJSON: JSON.stringify({ sessionId }),
+    });
+  } catch (err) {
+    backgroundProcesses.delete(sessionId);
+    await sendInvokeResult(client, frame, {
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: String(err) },
+    });
+  }
+}
+
+async function handleProcessList(client: GatewayClient, frame: NodeInvokeRequestPayload) {
+  const sessions = Array.from(backgroundProcesses.values()).map((proc) => ({
+    sessionId: proc.sessionId,
+    command: proc.rawCommand || formatCommand(proc.argv),
+    cwd: proc.cwd,
+    usePty: proc.usePty,
+    startedAt: proc.startedAt,
+    settled: proc.settled,
+    exitCode: proc.exitCode,
+  }));
+
+  await sendInvokeResult(client, frame, {
+    ok: true,
+    payloadJSON: JSON.stringify({ sessions }),
+  });
+}
+
+async function handleProcessLog(client: GatewayClient, frame: NodeInvokeRequestPayload) {
+  let params: SystemProcessLogParams;
+  try {
+    params = decodeParams<SystemProcessLogParams>(frame.paramsJSON);
+  } catch (err) {
+    await sendInvokeResult(client, frame, {
+      ok: false,
+      error: { code: "INVALID_REQUEST", message: String(err) },
+    });
+    return;
+  }
+
+  const proc = backgroundProcesses.get(params.sessionId);
+  if (!proc) {
+    await sendInvokeResult(client, frame, {
+      ok: false,
+      error: { code: "NOT_FOUND", message: "session not found" },
+    });
+    return;
+  }
+
+  const offset = typeof params.offset === "number" ? params.offset : 0;
+  const limit = typeof params.limit === "number" ? params.limit : undefined;
+  const output = limit
+    ? proc.output.substring(offset, offset + limit)
+    : proc.output.substring(offset);
+
+  await sendInvokeResult(client, frame, {
+    ok: true,
+    payloadJSON: JSON.stringify({
+      output,
+      totalLength: proc.output.length,
+      settled: proc.settled,
+      exitCode: proc.exitCode,
+    }),
+  });
+}
+
+async function handleProcessWrite(client: GatewayClient, frame: NodeInvokeRequestPayload) {
+  let params: SystemProcessWriteParams;
+  try {
+    params = decodeParams<SystemProcessWriteParams>(frame.paramsJSON);
+  } catch (err) {
+    await sendInvokeResult(client, frame, {
+      ok: false,
+      error: { code: "INVALID_REQUEST", message: String(err) },
+    });
+    return;
+  }
+
+  const proc = backgroundProcesses.get(params.sessionId);
+  if (!proc) {
+    await sendInvokeResult(client, frame, {
+      ok: false,
+      error: { code: "NOT_FOUND", message: "session not found" },
+    });
+    return;
+  }
+
+  try {
+    if (proc.pty) {
+      proc.pty.write(params.data);
+    } else if (proc.child?.stdin) {
+      proc.child.stdin.write(params.data);
+      if (params.eof) {
+        proc.child.stdin.end();
+      }
+    } else {
+      throw new Error("Process has no stdin");
+    }
+
+    await sendInvokeResult(client, frame, {
+      ok: true,
+      payloadJSON: JSON.stringify({ written: true }),
+    });
+  } catch (err) {
+    await sendInvokeResult(client, frame, {
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: String(err) },
+    });
+  }
+}
+
+async function handleProcessKill(client: GatewayClient, frame: NodeInvokeRequestPayload) {
+  let params: SystemProcessKillParams;
+  try {
+    params = decodeParams<SystemProcessKillParams>(frame.paramsJSON);
+  } catch (err) {
+    await sendInvokeResult(client, frame, {
+      ok: false,
+      error: { code: "INVALID_REQUEST", message: String(err) },
+    });
+    return;
+  }
+
+  const proc = backgroundProcesses.get(params.sessionId);
+  if (!proc) {
+    await sendInvokeResult(client, frame, {
+      ok: false,
+      error: { code: "NOT_FOUND", message: "session not found" },
+    });
+    return;
+  }
+
+  try {
+    if (proc.pty) {
+      proc.pty.kill();
+    } else if (proc.child) {
+      proc.child.kill("SIGTERM");
+    }
+    backgroundProcesses.delete(params.sessionId);
+
+    await sendInvokeResult(client, frame, {
+      ok: true,
+      payloadJSON: JSON.stringify({ killed: true }),
+    });
+  } catch (err) {
+    await sendInvokeResult(client, frame, {
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: String(err) },
+    });
+  }
+}
+
 export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
   const config = await ensureNodeHostConfig();
   const nodeId = opts.nodeId?.trim() || config.nodeId;
@@ -694,6 +997,11 @@ export async function runNodeHost(opts: NodeHostRunOptions): Promise<void> {
       "system.which",
       "system.execApprovals.get",
       "system.execApprovals.set",
+      "system.process.start",
+      "system.process.list",
+      "system.process.log",
+      "system.process.write",
+      "system.process.kill",
       ...(browserProxyEnabled ? ["browser.proxy"] : []),
     ],
     pathEnv,
@@ -924,6 +1232,32 @@ async function handleInvoke(
         error: { code: "INVALID_REQUEST", message: String(err) },
       });
     }
+    return;
+  }
+
+  // Handle different commands
+  if (command === "system.process.start") {
+    await handleProcessStart(client, frame);
+    return;
+  }
+
+  if (command === "system.process.list") {
+    await handleProcessList(client, frame);
+    return;
+  }
+
+  if (command === "system.process.log") {
+    await handleProcessLog(client, frame);
+    return;
+  }
+
+  if (command === "system.process.write") {
+    await handleProcessWrite(client, frame);
+    return;
+  }
+
+  if (command === "system.process.kill") {
+    await handleProcessKill(client, frame);
     return;
   }
 

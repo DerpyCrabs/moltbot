@@ -47,6 +47,8 @@ export interface ProcessSession {
   exited: boolean;
   truncated: boolean;
   backgrounded: boolean;
+  host?: "gateway" | "node";
+  nodeId?: string;
 }
 
 export interface FinishedSession {
