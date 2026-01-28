@@ -862,6 +862,9 @@ export function createExecTool(
         });
         workdir = resolved.hostWorkdir;
         containerWorkdir = resolved.containerWorkdir;
+      } else if (host === "node") {
+        // For node execution, don't validate workdir locally - let the node handle it
+        workdir = rawWorkdir;
       } else {
         workdir = resolveWorkdir(rawWorkdir, warnings);
       }

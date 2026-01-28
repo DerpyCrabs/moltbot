@@ -3,7 +3,7 @@ export function buildNodeShellCommand(command: string, platform?: string | null)
     .trim()
     .toLowerCase();
   if (normalized.startsWith("win")) {
-    return ["cmd.exe", "/d", "/s", "/c", command];
+    return ["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c", command];
   }
   return ["/bin/sh", "-lc", command];
 }

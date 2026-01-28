@@ -86,6 +86,7 @@ const NodesToolSchema = Type.Object({
   commandTimeoutMs: Type.Optional(Type.Number()),
   invokeTimeoutMs: Type.Optional(Type.Number()),
   needsScreenRecording: Type.Optional(Type.Boolean()),
+  usePty: Type.Optional(Type.Boolean()),
 });
 
 export function createNodesTool(options?: {
@@ -423,6 +424,7 @@ export function createNodesTool(options?: {
               typeof params.needsScreenRecording === "boolean"
                 ? params.needsScreenRecording
                 : undefined;
+            const usePty = typeof params.usePty === "boolean" ? params.usePty : undefined;
             const raw = (await callGatewayTool("node.invoke", gatewayOpts, {
               nodeId,
               command: "system.run",
@@ -432,6 +434,7 @@ export function createNodesTool(options?: {
                 env,
                 timeoutMs: commandTimeoutMs,
                 needsScreenRecording,
+                usePty,
                 agentId,
                 sessionKey,
               },
