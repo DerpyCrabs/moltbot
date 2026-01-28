@@ -69,6 +69,7 @@ type SystemRunParams = {
   approved?: boolean | null;
   approvalDecision?: string | null;
   runId?: string | null;
+  usePty?: boolean | null;
 };
 
 type SystemWhichParams = {
@@ -421,6 +422,154 @@ async function runCommand(
     child.on("exit", (code) => {
       finalize(code === null ? undefined : code, null);
     });
+  });
+}
+
+type PtySpawn = (
+  file: string,
+  args: string[],
+  options: {
+    cwd?: string;
+    env?: Record<string, string>;
+    name?: string;
+    cols?: number;
+    rows?: number;
+  },
+) => {
+  onData: (callback: (data: string) => void) => void;
+  onExit: (callback: (event: { exitCode: number }) => void) => void;
+  kill: (signal?: string) => void;
+};
+
+async function runCommandWithPty(
+  argv: string[],
+  cwd: string | undefined,
+  env: Record<string, string> | undefined,
+  timeoutMs: number | undefined,
+): Promise<RunResult> {
+  return await new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let outputLen = 0;
+    let truncated = false;
+    let timedOut = false;
+    let settled = false;
+    let pty: ReturnType<PtySpawn> | undefined;
+    let child: ReturnType<typeof spawn> | undefined;
+
+    const finalize = (exitCode?: number, error?: string | null) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (pty) {
+        try {
+          pty.kill();
+        } catch {
+          // ignore
+        }
+      }
+      if (child) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // ignore
+        }
+      }
+      resolve({
+        exitCode,
+        timedOut,
+        success: exitCode === 0 && !timedOut && !error,
+        stdout,
+        stderr,
+        error: error ?? null,
+        truncated,
+      });
+    };
+
+    let timer: NodeJS.Timeout | undefined;
+    if (timeoutMs && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        finalize(undefined, "Command timed out");
+      }, timeoutMs);
+    }
+
+    const onData = (data: string) => {
+      if (outputLen >= OUTPUT_CAP) {
+        truncated = true;
+        return;
+      }
+      const remaining = OUTPUT_CAP - outputLen;
+      const slice = data.length > remaining ? data.substring(0, remaining) : data;
+      outputLen += Buffer.byteLength(slice, "utf8");
+      stdout += slice;
+      if (data.length > remaining) truncated = true;
+    };
+
+    // Try PTY first
+    void (async () => {
+      try {
+        const ptyModule = (await import("@lydell/node-pty")) as unknown as {
+          spawn?: PtySpawn;
+          default?: { spawn?: PtySpawn };
+        };
+        const spawnPty = ptyModule.spawn ?? ptyModule.default?.spawn;
+        if (!spawnPty) {
+          throw new Error("PTY support is unavailable (node-pty spawn not found).");
+        }
+
+        pty = spawnPty(argv[0], argv.slice(1), {
+          cwd,
+          env,
+          name: process.env.TERM ?? "xterm-256color",
+          cols: 120,
+          rows: 30,
+        });
+
+        pty.onData(onData);
+
+        pty.onExit(({ exitCode }) => {
+          finalize(exitCode, null);
+        });
+      } catch (err) {
+        // PTY failed, fall back to regular spawn
+        const errText = String(err);
+        stderr += `Warning: PTY spawn failed (${errText}); falling back to non-interactive mode.\n`;
+
+        const fallbackChild = spawn(argv[0], argv.slice(1), {
+          cwd,
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+        });
+        child = fallbackChild;
+
+        const onChunk = (chunk: Buffer, target: "stdout" | "stderr") => {
+          if (outputLen >= OUTPUT_CAP) {
+            truncated = true;
+            return;
+          }
+          const remaining = OUTPUT_CAP - outputLen;
+          const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+          const str = slice.toString("utf8");
+          outputLen += slice.length;
+          if (target === "stdout") stdout += str;
+          else stderr += str;
+          if (chunk.length > remaining) truncated = true;
+        };
+
+        fallbackChild.stdout?.on("data", (chunk) => onChunk(chunk as Buffer, "stdout"));
+        fallbackChild.stderr?.on("data", (chunk) => onChunk(chunk as Buffer, "stderr"));
+
+        fallbackChild.on("error", (error) => {
+          finalize(undefined, error.message);
+        });
+
+        fallbackChild.on("exit", (code) => {
+          finalize(code === null ? undefined : code, null);
+        });
+      }
+    })();
   });
 }
 
@@ -877,6 +1026,7 @@ async function handleInvoke(
       agentId: agentId ?? null,
       sessionKey: sessionKey ?? null,
       approvalDecision,
+      usePty: params.usePty ?? null,
     };
     const response = await runViaMacAppExecHost({ approvals, request: execRequest });
     if (!response) {
@@ -1055,12 +1205,15 @@ async function handleInvoke(
     return;
   }
 
-  const result = await runCommand(
-    argv,
-    params.cwd?.trim() || undefined,
-    env,
-    params.timeoutMs ?? undefined,
-  );
+  const usePty = params.usePty === true;
+  const result = usePty
+    ? await runCommandWithPty(
+        argv,
+        params.cwd?.trim() || undefined,
+        env,
+        params.timeoutMs ?? undefined,
+      )
+    : await runCommand(argv, params.cwd?.trim() || undefined, env, params.timeoutMs ?? undefined);
   if (result.truncated) {
     const suffix = "... (truncated)";
     if (result.stderr.trim().length > 0) {

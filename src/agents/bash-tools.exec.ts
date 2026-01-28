@@ -1001,6 +1001,7 @@ export function createExecTool(
               approved: approvedByAsk,
               approvalDecision: approvalDecision ?? undefined,
               runId: runId ?? undefined,
+              usePty: params.pty === true ? true : undefined,
             },
             idempotencyKey: crypto.randomUUID(),
           }) satisfies Record<string, unknown>;

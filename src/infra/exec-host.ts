@@ -11,6 +11,7 @@ export type ExecHostRequest = {
   agentId?: string | null;
   sessionKey?: string | null;
   approvalDecision?: "allow-once" | "allow-always" | null;
+  usePty?: boolean | null;
 };
 
 export type ExecHostRunResult = {
